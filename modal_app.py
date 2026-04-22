@@ -1,242 +1,107 @@
-import os
-import uuid
-import io
-import tempfile
-import traceback
-from pathlib import Path
-from typing import List, Optional
-
 import modal
-from fastapi import UploadFile, File, HTTPException, Form
-from fastapi.responses import Response
-from pydantic import BaseModel
+import subprocess
+import time
+import httpx
+from fastapi import UploadFile, File, Response
 
-# --- 1. Pydantic Models ---
-class LoadModelsRequest(BaseModel):
-    encoder_path: str
-    synthesizer_path: str
-    vocoder_path: Optional[str] = None
-
-class SynthesizeRequest(BaseModel):
-    text: str
-    embed: List[float]
-    seed: Optional[int] = None
-
-class VocodeRequest(BaseModel):
-    spec_id: str
-    seed: Optional[int] = None
-
-class GenerateRequest(BaseModel):
-    text: str
-    embed: List[float]
-    seed: Optional[int] = None
-
-# --- 2. Define the Container Image ---
-app = modal.App("real-time-voice-cloning-backend")
+app = modal.App("real-time-voice-cloning-proxy")
 
 image = (
-    modal.Image.debian_slim(python_version="3.10") # Bumped to 3.10
-    .apt_install("ffmpeg", "libsndfile1", "build-essential") # Keeping build-essential for webrtcvad
-    .pip_install_from_requirements("requirements.txt")
-    .workdir("/root")
-    .add_local_dir("encoder", remote_path="/root/encoder")
-    .add_local_dir("synthesizer", remote_path="/root/synthesizer")
-    .add_local_dir("vocoder", remote_path="/root/vocoder")
-    .add_local_dir("utils", remote_path="/root/utils")
-    .add_local_dir("saved_models", remote_path="/root/saved_models")
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libsndfile1", "curl")
+    .pip_install("fastapi[standard]")
+    .add_local_file("requirements.txt", "/root/requirements.txt", copy=True)
+    
+    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh")
+    
+    .run_commands(
+        "uv venv --python 3.9 /root/venv",
+        "uv pip install --python /root/venv 'setuptools<70.0.0' wheel",
+        
+        # CRITICAL FIX: Explicitly install PyTorch before your requirements.txt
+        "uv pip install --python /root/venv torch torchaudio",
+        
+        "uv pip install --python /root/venv --no-build-isolation -r /root/requirements.txt",
+        "uv pip install --python /root/venv uvicorn fastapi python-multipart" 
+    )
+    .add_local_dir(".", remote_path="/root", ignore=["saved_models/**", ".venv/**", "__pycache__/**"])
 )
-# --- 3. The Main Inference Class ---
+
+model_volume = modal.Volume.from_name("voice-cloning-models")
+
 @app.cls(
     image=image, 
     gpu="T4", 
+    volumes={"/root/saved_models": model_volume},
     timeout=600,
-    container_idle_timeout=300, 
-    allow_concurrent_inputs=10 
+    scaledown_window=300
+    # Removed allow_concurrent_inputs to fix the deprecation warning
 )
-class VoiceCloningAPI:
+class VoiceCloningProxy:
     @modal.enter()
     def setup(self):
-        import sys
-        if "/root" not in sys.path:
-            sys.path.append("/root")
-            
-        from encoder import inference as encoder
-        from synthesizer.inference import Synthesizer
-        from vocoder import inference as vocoder
-
-        self.encoder = encoder
-        self.Synthesizer = Synthesizer
-        self.vocoder = vocoder
-        self.synthesizer_instance = None
-        self.cached_specs = {}
-
-    # --- 4. The Routes ---
-
-    @modal.web_endpoint(method="GET")
-    def list_models(self):
-        models_dir = Path("/root/saved_models")
-        if not models_dir.exists():
-            return {"encoders": [], "synthesizers": [], "vocoders": []}
-
-        encoders = [str(f) for f in models_dir.glob("*/encoder.pt")]
-        synthesizers = [str(f) for f in models_dir.glob("*/synthesizer.pt")]
-        vocoders = [str(f) for f in models_dir.glob("*/vocoder.pt")]
-
-        return {
-            "encoders": encoders,
-            "synthesizers": synthesizers,
-            "vocoders": vocoders
-        }
-
-    @modal.web_endpoint(method="POST")
-    def load_models(self, req: LoadModelsRequest):
-        try:
-            if not Path(req.encoder_path).exists():
-                raise HTTPException(status_code=400, detail="Encoder model not found")
-            if not Path(req.synthesizer_path).exists():
-                raise HTTPException(status_code=400, detail="Synthesizer model not found")
-            
-            self.encoder.load_model(Path(req.encoder_path))
-            self.synthesizer_instance = self.Synthesizer(Path(req.synthesizer_path))
-            
-            if req.vocoder_path and req.vocoder_path != "Griffin-Lim":
-                if not Path(req.vocoder_path).exists():
-                    raise HTTPException(status_code=400, detail="Vocoder model not found")
-                self.vocoder.load_model(Path(req.vocoder_path))
-                
-            return {"status": "success", "message": "Models loaded successfully"}
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @modal.web_endpoint(method="POST")
-    async def extract_embedding(self, file: UploadFile = File(...)):
-        import numpy as np # Delayed import
+        import socket
         
-        if not self.encoder.is_loaded():
-            raise HTTPException(status_code=400, detail="Encoder model not loaded")
-            
-        try:
-            audio_bytes = await file.read()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(audio_bytes)
-                tmp_path = tmp.name
-                
+        print("Starting Python 3.9 background server...")
+        self.process = subprocess.Popen(
+            ["/root/venv/bin/python", "-m", "uvicorn", "api_39:app", "--host", "127.0.0.1", "--port", "8000"],
+            cwd="/root"
+        )
+        
+        # Smart Polling: Wait until the port is actively accepting connections
+        start_time = time.time()
+        is_ready = False
+        print("Waiting for Uvicorn to bind to port 8000...")
+        
+        while time.time() - start_time < 90:  # Give it up to 90 seconds to load heavy models
             try:
-                wav = self.Synthesizer.load_preprocess_wav(tmp_path)
-                encoder_wav = self.encoder.preprocess_wav(wav)
-                embed, partial_embeds, _ = self.encoder.embed_utterance(encoder_wav, return_partials=True)
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            
-            return {"embed": embed.tolist()}
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+                with socket.create_connection(("127.0.0.1", 8000), timeout=1):
+                    is_ready = True
+                    break
+            except OSError:
+                time.sleep(1)
+                
+        if is_ready:
+            print("✅ Inner Python 3.9 Server is UP and ready!")
+        else:
+            print("❌ Inner Server FAILED to start within 90 seconds.")
 
-    @modal.web_endpoint(method="POST")
-    def synthesize_spectrogram(self, req: SynthesizeRequest):
-        import numpy as np # Delayed import
-        import torch       # Delayed import
-        
-        if self.synthesizer_instance is None:
-            raise HTTPException(status_code=400, detail="Synthesizer model not loaded")
-            
-        if req.seed is not None:
-            torch.manual_seed(req.seed)
-            
-        try:
-            texts = req.text.split("\n")
-            embeds = [np.array(req.embed)] * len(texts)
-            
-            specs = self.synthesizer_instance.synthesize_spectrograms(texts, embeds)
-            breaks = [spec.shape[1] for spec in specs]
-            spec = np.concatenate(specs, axis=1)
-            
-            spec_id = str(uuid.uuid4())
-            self.cached_specs[spec_id] = (spec, breaks)
-            
-            return {"spec_id": spec_id, "breaks": breaks}
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+    # --- Proxy Routes (Updated to fastapi_endpoint) ---
+    
+    @modal.fastapi_endpoint(method="GET")
+    async def list_models(self):
+        async with httpx.AsyncClient() as client:
+            response = await client.get("http://127.0.0.1:8000/list_models", timeout=30)
+            return response.json()
 
-    @modal.web_endpoint(method="POST")
-    def vocode_audio(self, req: VocodeRequest):
-        import numpy as np     # Delayed import
-        import torch           # Delayed import
-        import soundfile as sf # Delayed import
-        
-        if req.spec_id not in self.cached_specs:
-            raise HTTPException(status_code=404, detail="Spectrogram not found")
-            
-        if req.seed is not None:
-            torch.manual_seed(req.seed)
-            
-        try:
-            spec, breaks = self.cached_specs[req.spec_id]
-            
-            if self.vocoder.is_loaded():
-                wav = self.vocoder.infer_waveform(spec)
-            else:
-                wav = self.Synthesizer.griffin_lim(spec)
-                
-            b_ends = np.cumsum(np.array(breaks) * self.Synthesizer.hparams.hop_size)
-            b_starts = np.concatenate(([0], b_ends[:-1]))
-            wavs = [wav[start:end] for start, end in zip(b_starts, b_ends)]
-            breaks_audio = [np.zeros(int(0.15 * self.Synthesizer.sample_rate))] * len(breaks)
-            wav = np.concatenate([i for w, b in zip(wavs, breaks_audio) for i in (w, b)])
-            
-            wav = wav / np.abs(wav).max() * 0.97
-            
-            with io.BytesIO() as out_io:
-                sf.write(out_io, wav, self.Synthesizer.sample_rate, format='WAV')
-                out_bytes = out_io.getvalue()
-                
-            return Response(content=out_bytes, media_type="audio/wav")
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+    @modal.fastapi_endpoint(method="POST")
+    async def load_models(self, req: dict):
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/load_models", json=req, timeout=120)
+            return response.json()
 
-    @modal.web_endpoint(method="POST")
-    def generate_audio(self, req: GenerateRequest):
-        import numpy as np     # Delayed import
-        import torch           # Delayed import
-        import soundfile as sf # Delayed import
-        
-        if self.synthesizer_instance is None:
-            raise HTTPException(status_code=400, detail="Synthesizer model not loaded")
-            
-        if req.seed is not None:
-            torch.manual_seed(req.seed)
-            
-        try:
-            texts = req.text.split("\n")
-            embeds = [np.array(req.embed)] * len(texts)
-            specs = self.synthesizer_instance.synthesize_spectrograms(texts, embeds)
-            breaks = [spec.shape[1] for spec in specs]
-            spec = np.concatenate(specs, axis=1)
-            
-            if self.vocoder.is_loaded():
-                wav = self.vocoder.infer_waveform(spec)
-            else:
-                wav = self.Synthesizer.griffin_lim(spec)
-                
-            b_ends = np.cumsum(np.array(breaks) * self.Synthesizer.hparams.hop_size)
-            b_starts = np.concatenate(([0], b_ends[:-1]))
-            wavs = [wav[start:end] for start, end in zip(b_starts, b_ends)]
-            breaks_audio = [np.zeros(int(0.15 * self.Synthesizer.sample_rate))] * len(breaks)
-            wav = np.concatenate([i for w, b in zip(wavs, breaks_audio) for i in (w, b)])
-            
-            wav = wav / np.abs(wav).max() * 0.97
-            
-            with io.BytesIO() as out_io:
-                sf.write(out_io, wav, self.Synthesizer.sample_rate, format='WAV')
-                out_bytes = out_io.getvalue()
-                
-            return Response(content=out_bytes, media_type="audio/wav")
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+    @modal.fastapi_endpoint(method="POST")
+    async def extract_embedding(self, file: UploadFile = File(...)):
+        file_bytes = await file.read()
+        files = {'file': (file.filename, file_bytes, file.content_type)}
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/extract_embedding", files=files, timeout=120)
+            return response.json()
+
+    @modal.fastapi_endpoint(method="POST")
+    async def synthesize_spectrogram(self, req: dict):
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/synthesize_spectrogram", json=req, timeout=120)
+            return response.json()
+
+    @modal.fastapi_endpoint(method="POST")
+    async def vocode_audio(self, req: dict):
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/vocode_audio", json=req, timeout=120)
+            return Response(content=response.content, media_type="audio/wav")
+
+    @modal.fastapi_endpoint(method="POST")
+    async def generate_audio(self, req: dict):
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/generate_audio", json=req, timeout=300)
+            return Response(content=response.content, media_type="audio/wav")
