@@ -22,7 +22,9 @@ image = (
         "uv pip install --python /root/venv torch torchaudio",
         
         "uv pip install --python /root/venv --no-build-isolation -r /root/requirements.txt",
-        "uv pip install --python /root/venv uvicorn fastapi python-multipart" 
+        # "uv pip install --python /root/venv uvicorn fastapi python-multipart" 
+
+        "uv pip install --python /root/venv uvicorn fastapi python-multipart matplotlib"
     )
     .add_local_dir(".", remote_path="/root", ignore=["saved_models/**", ".venv/**", "__pycache__/**"])
 )
@@ -68,11 +70,11 @@ class VoiceCloningProxy:
 
     # --- Proxy Routes (Updated to fastapi_endpoint) ---
     
-    @modal.fastapi_endpoint(method="GET")
-    async def list_models(self):
-        async with httpx.AsyncClient() as client:
-            response = await client.get("http://127.0.0.1:8000/list_models", timeout=30)
-            return response.json()
+    # @modal.fastapi_endpoint(method="GET")
+    # async def list_models(self):
+    #     async with httpx.AsyncClient() as client:
+    #         response = await client.get("http://127.0.0.1:8000/list_models", timeout=30)
+    #         return response.json()
 
     @modal.fastapi_endpoint(method="POST")
     async def load_models(self, req: dict):
@@ -105,3 +107,9 @@ class VoiceCloningProxy:
         async with httpx.AsyncClient() as client:
             response = await client.post("http://127.0.0.1:8000/generate_audio", json=req, timeout=300)
             return Response(content=response.content, media_type="audio/wav")
+        
+    @modal.fastapi_endpoint(method="GET")
+    async def spectrogram_image(self, spec_id: str):
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"http://127.0.0.1:8000/spectrogram_image/{spec_id}", timeout=60)
+            return Response(content=response.content, media_type="image/png")
